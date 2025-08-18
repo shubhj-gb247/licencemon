@@ -20,7 +20,8 @@ use windows::core::PWSTR;
 
 #[derive(Debug, serde::Serialize, Deserialize)]
 struct TrackingConfig {
-    applications: Vec<String>,
+    applications: Vec<String>, // vector of strings representing process name which we have to track.
+    interval: i32, // after every [interval] seconds send payload to server.
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -39,8 +40,9 @@ impl TimeCell {
     */
     fn update_end_time(&mut self) {
         self.time_end = Some(Utc::now());
-        self.duration = self.duration + (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
-        println!("Duration: {}s ",&self.duration);
+        self.duration =
+            self.duration + (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
+        println!("Duration: {}s ", &self.duration);
     }
 }
 
@@ -48,7 +50,7 @@ impl TimeCell {
 struct WinRecord {
     last: Option<String>,
 }
-static CONFIG: Lazy<TrackingConfig> = Lazy::new(load_tracking_config);
+static CONFIG: Lazy<Option<TrackingConfig>> = Lazy::new(load_tracking_config);
 static TIME_CELL_MAP: Lazy<Mutex<HashMap<String, TimeCell>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
@@ -56,25 +58,30 @@ static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
 static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<u32, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn load_tracking_config() -> TrackingConfig {
+fn load_tracking_config() -> Option<TrackingConfig>{
     let proj_dirs =
         ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Unable to get project dirs");
-    let config_path = proj_dirs.config_dir().join("tracking.json");
+    let config_path = proj_dirs.config_dir().join("config.json");
 
     if !config_path.exists() {
-        let default = TrackingConfig {
-            applications: vec!["notepad.exe".into(), "chrome.exe".into()],
-        };
-        fs::create_dir_all(proj_dirs.config_dir()).ok();
-        fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&default).unwrap(),
-        )
-        .unwrap();
-        return default;
+        // let default = TrackingConfig {
+        //     applications: vec!["notepad.exe".into(), "chrome.exe".into()],
+        //     interval: 10,
+        // };
+        // fs::create_dir_all(proj_dirs.config_dir()).ok();
+        // fs::write(
+        //     &config_path,
+        //     serde_json::to_string_pretty(&default).unwrap(),
+        // )
+        // .unwrap();
+        // return default;
+        /*
+            If config file doesn't exist in server , return None
+         */
+        return None;
     }
 
-    let data = fs::read_to_string(config_path).expect("Failed to read tracking.json");
+    let data = fs::read_to_string(config_path).expect("Failed to read config.json");
     serde_json::from_str(&data).expect("Invalid JSON format in tracking.json")
 }
 
@@ -100,12 +107,14 @@ fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
         }
         //check cache first
         {
-            println!("Returning cached app name ");
             let cache = PROCESS_NAME_CACHE.lock().unwrap();
             if let Some(name) = cache.get(&pid) {
+                println!("Returning cached app name ");
                 return Some(name.clone());
             }
         }
+
+        println!("Getting process handle");
 
         let h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
 
@@ -126,14 +135,20 @@ fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
                     &mut size,
                 );
 
-                CloseHandle(handle);
+                CloseHandle(handle).expect("Couldn't close handle");
 
                 if result.is_err() {
                     return None;
                 }
 
                 let exe_path = String::from_utf16_lossy(&buffer[..size as usize]);
-                Some(exe_path.split('\\').last()?.to_string())
+                let exe_path = exe_path.split('\\').last()?.to_string();
+                {
+                    // Insert pid and exe name in map
+                    let mut cache = PROCESS_NAME_CACHE.lock().unwrap();
+                    cache.insert(pid, exe_path.clone());
+                }
+                Some(exe_path)
             }
         }
     }
@@ -149,15 +164,16 @@ unsafe extern "system" fn win_event_proc(
     _dwmsEventTime: u32,
 ) {
     if event == EVENT_SYSTEM_FOREGROUND {
+        println!("=========NEW EVENT_SYSTEM_FOREGROUND=============");
         if let Some(app_name) = get_process_name_from_hwnd(hwnd) {
             let title_lower = app_name.to_lowercase();
-            println!("{}", title_lower.trim());
+            println!("Switched to: {}", title_lower.trim());
 
             let mut data_map = TIME_CELL_MAP.lock().unwrap();
 
-/*
-Update last app time
- */
+            /*
+            Update last app time
+             */
             let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
             let data = last_app.last.as_ref();
             match data {
@@ -174,17 +190,15 @@ Update last app time
                         }
                     }
                 }
-                None => println!(" No last app."),
+                None => println!("No last app."),
             }
 
             last_app.last = None; //clear the last app, if the app for which this current event run is generated is tracked last app will be set to that.
 
-
-
             let ref_data = data_map.get_mut(&title_lower);
             match ref_data {
                 Some(data) => {
-                    println!("Updating start for {}",title_lower.trim());
+                    println!("Updating start for {}", title_lower.trim());
                     data.update_start_time();
                 }
                 None => {
@@ -202,63 +216,7 @@ Update last app time
     }
 }
 
-// unsafe extern "system" fn win_event_proc(
-//     _hWinEventHook: HWINEVENTHOOK,
-//     event: u32,
-//     hwnd: HWND,
-//     _idObject: i32,
-//     _idChild: i32,
-//     _idEventThread: u32,
-//     _dwmsEventTime: u32,
-// ) {
-//     if event == EVENT_SYSTEM_FOREGROUND {
-//         let length = GetWindowTextLengthW(hwnd);
-//         if length > 0 {
-//             let mut buffer: Vec<u16> = vec![0; (length + 1) as usize];
-//             let copied = GetWindowTextW(hwnd, &mut buffer);
-//             if copied > 0 {
-//                 if let Ok(title) = String::from_utf16(&buffer[..copied as usize]) {
-//                     let title_lower = title.to_lowercase();
-//                     println!("{}", title_lower.trim());
-//                     let mut data_map = TIME_CELL_MAP.lock().unwrap();
-//                     let ref_data = data_map.get_mut(&title_lower);
-//                     match ref_data {
-//                         Some(data) => {
-//                             data.update_start_time();
-//                         }
-//                         None => {
-//                             println!("Not interested in the switched application");
-//                             return;
-//                             /*
-//                             If we switched to a non-tracked app, we won't update it as last app and
-//                             return above.
-//                              */
-//                         }
-//                     }
-//
-//                     let mut last_app= WIN_RECORD_INSTANCE.lock().unwrap();
-//                     let data = last_app.last.as_ref();
-//                     match data {
-//                         Some(app_str) => {
-//                             let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
-//                             match ref_data_last {
-//                                 Some(data) => {
-//                                     data.update_end_time();
-//                                 },
-//                                 None => {
-//                                     println!("Not a tracked last app.");
-//                                 }
-//                             }
-//                         },
-//                         None => println!(" No last app.")
-//                     }
-//
-//                     last_app.last = Some(title_lower);
-//                 }
-//             }
-//         }
-//     }
-// }
+
 
 fn load_icon(path: &str) -> Icon {
     let img = ImageReader::open(path)
@@ -284,14 +242,27 @@ fn build_icon() -> Icon {
     Icon::from_rgba(rgba, size, size).expect("icon")
 }
 fn main() {
-    println!("Loaded tracking applications: {:?}", CONFIG.applications);
+
+    if CONFIG.is_none(){
+        println!("No config file detected .");
+        return;
+    }
+
+    let config = CONFIG.as_ref();
 
     {
+        /*
+        Added scope to return the lock on TIME_CELL_MAP
+         */
+
         let mut data_map = TIME_CELL_MAP.lock().unwrap();
 
-        for app in &CONFIG.applications {
+        for x in &config.unwrap().applications{
+
+            println!("{}", x);
+
             data_map.insert(
-                app.clone(),
+                x.clone(),
                 TimeCell {
                     time_start: None,
                     time_end: None,
