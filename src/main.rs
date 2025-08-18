@@ -1,168 +1,264 @@
-//#![windows_subsystem = "windows"]
-use anyhow::{Context, Result};
-use chrono::Utc;
-use image::ImageReader;
-use image::{ImageBuffer, Rgba};
+use chrono::{DateTime, Duration, Local, Utc};
+use directories::ProjectDirs;
+use image::{ImageBuffer, ImageReader, Rgba};
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
-use std::thread;
-use std::time::Duration;
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::*;
+use windows::Win32::Storage::FileSystem::*;
+use windows::Win32::System::Diagnostics::ToolHelp::*;
+use windows::Win32::System::Threading::*;
+use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-static IS_RUNNING: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
-static MONITOR_THREAD: Lazy<Arc<Mutex<Option<thread::JoinHandle<()>>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+use windows::core::PWSTR;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct AppConfig {
-    server_url: String,
-    interval_secs: u64,
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct TrackingConfig {
+    applications: Vec<String>,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            server_url: "http://127.0.0.1:8080/api/windows".to_string(),
-            interval_secs: 3,
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+struct TimeCell {
+    time_start: Option<DateTime<Utc>>,
+    time_end: Option<DateTime<Utc>>,
+    duration: i64, // in seconds
+}
+impl TimeCell {
+    fn update_start_time(&mut self) {
+        self.time_start = Some(Utc::now());
+    }
+
+    /*
+       Updates the end time & calculates duration using start_time and end_time.
+    */
+    fn update_end_time(&mut self) {
+        self.time_end = Some(Utc::now());
+        self.duration = self.duration + (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
+        println!("Duration: {}s ",&self.duration);
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+struct WinRecord {
+    last: Option<String>,
+}
+static CONFIG: Lazy<TrackingConfig> = Lazy::new(load_tracking_config);
+static TIME_CELL_MAP: Lazy<Mutex<HashMap<String, TimeCell>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
+    Lazy::new(|| Mutex::new(WinRecord { last: None }));
+static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<u32, String>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn load_tracking_config() -> TrackingConfig {
+    let proj_dirs =
+        ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Unable to get project dirs");
+    let config_path = proj_dirs.config_dir().join("tracking.json");
+
+    if !config_path.exists() {
+        let default = TrackingConfig {
+            applications: vec!["notepad.exe".into(), "chrome.exe".into()],
+        };
+        fs::create_dir_all(proj_dirs.config_dir()).ok();
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&default).unwrap(),
+        )
+        .unwrap();
+        return default;
+    }
+
+    let data = fs::read_to_string(config_path).expect("Failed to read tracking.json");
+    serde_json::from_str(&data).expect("Invalid JSON format in tracking.json")
+}
+
+fn save_tracking_log() {
+    let proj_dirs =
+        ProjectDirs::from("com", "example", "winwatch-tray").expect("Unable to get project dirs");
+    let log_path = proj_dirs.data_dir().join("tracking_log.json");
+    fs::create_dir_all(proj_dirs.data_dir()).ok();
+
+    let data_map = TIME_CELL_MAP.lock().unwrap();
+    let json = serde_json::to_string_pretty(&*data_map).unwrap();
+    fs::write(&log_path, json).expect("Failed to write tracking_log.json");
+}
+
+fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut pid: u32 = 0;
+
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+        if pid == 0 {
+            return None;
+        }
+        //check cache first
+        {
+            println!("Returning cached app name ");
+            let cache = PROCESS_NAME_CACHE.lock().unwrap();
+            if let Some(name) = cache.get(&pid) {
+                return Some(name.clone());
+            }
+        }
+
+        let h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+
+        match h_process {
+            Err(error) => {
+                println!("{error}");
+                return None;
+            }
+            Ok(handle) => {
+                let mut buffer = [0u16; 260];
+                // let mut buffer_ptr= PWSTR::default();
+                let mut size = buffer.len() as u32;
+
+                let result = QueryFullProcessImageNameW(
+                    handle,
+                    windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+                    PWSTR(buffer.as_mut_ptr()),
+                    &mut size,
+                );
+
+                CloseHandle(handle);
+
+                if result.is_err() {
+                    return None;
+                }
+
+                let exe_path = String::from_utf16_lossy(&buffer[..size as usize]);
+                Some(exe_path.split('\\').last()?.to_string())
+            }
         }
     }
 }
 
-#[derive(Serialize)]
-struct Payload {
-    timestamp: String,
-    host: String,
-    windows: Vec<String>,
-}
+unsafe extern "system" fn win_event_proc(
+    _hWinEventHook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _idObject: i32,
+    _idChild: i32,
+    _idEventThread: u32,
+    _dwmsEventTime: u32,
+) {
+    if event == EVENT_SYSTEM_FOREGROUND {
+        if let Some(app_name) = get_process_name_from_hwnd(hwnd) {
+            let title_lower = app_name.to_lowercase();
+            println!("{}", title_lower.trim());
 
-fn app_dirs() -> Result<(path::PathBuf, path::PathBuf)> {
-    let proj = directories::ProjectDirs::from("", "Neilsoft", "licensemon").context("cannot resolve ProjectDirs")?;
-    let cfg_dir = proj.config_dir().to_path_buf();
-    let data_dir = proj.data_dir().to_path_buf();
-    std::fs::create_dir_all(&cfg_dir).ok();
-    std::fs::create_dir_all(&data_dir).ok();
-    Ok((cfg_dir, data_dir))
-}
+            let mut data_map = TIME_CELL_MAP.lock().unwrap();
 
-fn load_config() -> Result<AppConfig> {
-    let (cfg_dir, _) = app_dirs()?;
-    let cfg_path = cfg_dir.join("config.json");
-    if cfg_path.exists() {
-        let s = std::fs::read_to_string(&cfg_path).context("read config.json")?;
-        let cfg: AppConfig = serde_json::from_str(&s).context("parse config.json")?;
-        Ok(cfg)
-    } else {
-        let cfg = AppConfig::default();
-        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?).ok();
-        Ok(cfg)
-    }
-}
-
-fn load_keywords() -> Result<HashSet<String>> {
-    let (cfg_dir, _) = app_dirs()?;
-    let kw_path = cfg_dir.join("keywords.json");
-    if kw_path.exists() {
-        let s = std::fs::read_to_string(&kw_path).context("read keywords.json")?;
-        let vals: Vec<String> = serde_json::from_str(&s).context("parse keywords.json")?;
-        Ok(vals.into_iter().map(|s| s.to_lowercase()).collect())
-    } else {
-        let sample = vec!["chrome", "visual studio", "grafana", "notepad"];
-        std::fs::write(&kw_path, serde_json::to_vec_pretty(&sample)?).ok();
-        Ok(sample.into_iter().map(|s| s.to_string()).map(|s| s.to_lowercase()).collect())
-    }
-}
-
-fn get_window_titles() -> Vec<String> {
-    let mut titles = Vec::new();
-
-    unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        if IsWindowVisible(hwnd).as_bool() {
-            let length = GetWindowTextLengthW(hwnd);
-            if length > 0 {
-                let mut buffer: Vec<u16> = vec![0; (length as usize) + 1];
-                let copied = GetWindowTextW(hwnd, &mut buffer);
-                if copied > 0 {
-                    if let Ok(title) = String::from_utf16(&buffer[..copied as usize]) {
-                        if !title.trim().is_empty() {
-                            let titles = unsafe { &mut *(lparam.0 as *mut Vec<String>) };
-                            titles.push(title);
+/*
+Update last app time
+ */
+            let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
+            let data = last_app.last.as_ref();
+            match data {
+                Some(app_str) => {
+                    println!("last app name: {}", app_str);
+                    let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
+                    match ref_data_last {
+                        Some(data) => {
+                            println!("Updating end time for {app_str}");
+                            data.update_end_time();
+                        }
+                        None => {
+                            println!("Not a tracked last app.");
                         }
                     }
                 }
+                None => println!(" No last app."),
             }
-        }
-        true.into()
-    }
 
-    unsafe {
-        let ptr = &mut titles as *mut _ as isize;
-        EnumWindows(Some(enum_windows_proc), LPARAM(ptr)).expect("TODO: panic message");
-    }
+            last_app.last = None; //clear the last app, if the app for which this current event run is generated is tracked last app will be set to that.
 
-    titles
-}
 
-fn send_payload(server_url: &str, matched: Vec<String>) {
-    let host = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "unknown".into());
-    let payload = Payload {
-        timestamp: Utc::now().to_rfc3339(),
-        host,
-        windows: matched,
-    };
 
-    let client = reqwest::blocking::Client::new();
-    let res = client.post(server_url).json(&payload).send();
-    match res {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                eprintln!("[winwatch] server responded: {}", resp.status());
+            let ref_data = data_map.get_mut(&title_lower);
+            match ref_data {
+                Some(data) => {
+                    println!("Updating start for {}",title_lower.trim());
+                    data.update_start_time();
+                }
+                None => {
+                    println!("Not interested in the switched application");
+                    return;
+                    /*
+                    If we switched to a non-tracked app, we won't update it as last app and
+                    return above.
+                     */
+                }
             }
-        }
-        Err(e) => eprintln!("[winwatch] send failed: {e:?}"),
-    }
-}
 
-fn monitor_loop(is_running: Arc<AtomicBool>, cfg: AppConfig, _keywords: HashSet<String>) {
-    let interval = Duration::from_secs(cfg.interval_secs.max(5));
-    while is_running.load(Ordering::SeqCst) {
-        let titles = get_window_titles();
-        println!("{:#?}",titles);
-        // let matched: Vec<String> = titles
-        //     .into_iter()
-        //     .filter(|t| {
-        //         let lower = t.to_lowercase();
-        //         keywords.iter().any(|k| lower.contains(k))
-        //     })
-        //     .collect();
-        //
-        // if !matched.is_empty() {
-        //     send_payload(&cfg.server_url, matched);
-        // }
-        send_payload(&cfg.server_url,titles);
-
-        let mut slept = Duration::ZERO;
-        while slept < interval {
-            if !is_running.load(Ordering::SeqCst) { break; }
-            thread::sleep(Duration::from_millis(200));
-            slept += Duration::from_millis(200);
+            last_app.last = Some(title_lower);
         }
     }
 }
 
-fn build_icon() -> Icon {
-    let size = 16u32;
-    let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(size, size);
-    for (x, y, p) in img.enumerate_pixels_mut() {
-        let on = ((x / 2 + y / 2) % 2) == 0;
-        *p = if on { Rgba([0u8, 140u8, 255u8, 255u8]) } else { Rgba([255, 255, 255, 255]) };
-    }
-    let rgba = img.into_raw();
-    Icon::from_rgba(rgba, size, size).expect("icon")
-}
+// unsafe extern "system" fn win_event_proc(
+//     _hWinEventHook: HWINEVENTHOOK,
+//     event: u32,
+//     hwnd: HWND,
+//     _idObject: i32,
+//     _idChild: i32,
+//     _idEventThread: u32,
+//     _dwmsEventTime: u32,
+// ) {
+//     if event == EVENT_SYSTEM_FOREGROUND {
+//         let length = GetWindowTextLengthW(hwnd);
+//         if length > 0 {
+//             let mut buffer: Vec<u16> = vec![0; (length + 1) as usize];
+//             let copied = GetWindowTextW(hwnd, &mut buffer);
+//             if copied > 0 {
+//                 if let Ok(title) = String::from_utf16(&buffer[..copied as usize]) {
+//                     let title_lower = title.to_lowercase();
+//                     println!("{}", title_lower.trim());
+//                     let mut data_map = TIME_CELL_MAP.lock().unwrap();
+//                     let ref_data = data_map.get_mut(&title_lower);
+//                     match ref_data {
+//                         Some(data) => {
+//                             data.update_start_time();
+//                         }
+//                         None => {
+//                             println!("Not interested in the switched application");
+//                             return;
+//                             /*
+//                             If we switched to a non-tracked app, we won't update it as last app and
+//                             return above.
+//                              */
+//                         }
+//                     }
+//
+//                     let mut last_app= WIN_RECORD_INSTANCE.lock().unwrap();
+//                     let data = last_app.last.as_ref();
+//                     match data {
+//                         Some(app_str) => {
+//                             let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
+//                             match ref_data_last {
+//                                 Some(data) => {
+//                                     data.update_end_time();
+//                                 },
+//                                 None => {
+//                                     println!("Not a tracked last app.");
+//                                 }
+//                             }
+//                         },
+//                         None => println!(" No last app.")
+//                     }
+//
+//                     last_app.last = Some(title_lower);
+//                 }
+//             }
+//         }
+//     }
+// }
 
 fn load_icon(path: &str) -> Icon {
     let img = ImageReader::open(path)
@@ -173,28 +269,67 @@ fn load_icon(path: &str) -> Icon {
     let (width, height) = img.dimensions();
     Icon::from_rgba(img.into_raw(), width, height).expect("Failed to create icon")
 }
+fn build_icon() -> Icon {
+    let size = 16u32;
+    let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(size, size);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let on = ((x / 2 + y / 2) % 2) == 0;
+        *p = if on {
+            Rgba([0u8, 140u8, 255u8, 255u8])
+        } else {
+            Rgba([255, 255, 255, 255])
+        };
+    }
+    let rgba = img.into_raw();
+    Icon::from_rgba(rgba, size, size).expect("icon")
+}
+fn main() {
+    println!("Loaded tracking applications: {:?}", CONFIG.applications);
 
-fn main() -> Result<()> {
-    let cfg = load_config()?;
-    let keywords = load_keywords()?;
+    {
+        let mut data_map = TIME_CELL_MAP.lock().unwrap();
+
+        for app in &CONFIG.applications {
+            data_map.insert(
+                app.clone(),
+                TimeCell {
+                    time_start: None,
+                    time_end: None,
+                    duration: 0,
+                },
+            );
+        }
+    }
+
+    //let icon = load_icon("assets/ns.png");
     let icon = build_icon();
+    let _tray_icon: Arc<TrayIcon> = Arc::new(
+        TrayIconBuilder::new()
+            .with_tooltip("LicenseMon")
+            .with_icon(icon)
+            .build()
+            .unwrap(),
+    );
 
-    //let icon = load_icon("assets/ns.ico");
+    unsafe {
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            HINSTANCE::default(),
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
 
-    let _tray: TrayIcon = TrayIconBuilder::new()
-        .with_icon(icon)
-        //.with_menu(Box::new(menu))
-        .with_tooltip("NSLicenseMon")
-        .build()?;
+        println!("Tray app running with custom icon. Listening for focus changes...");
 
-    IS_RUNNING.store(true, Ordering::SeqCst);
-    let cfg_clone = cfg.clone();
-    let kw_clone = keywords.clone();
-    let is_running = IS_RUNNING.clone();
-    let handle = thread::spawn(move || monitor_loop(is_running, cfg_clone, kw_clone));
-    *MONITOR_THREAD.lock() = Some(handle);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).into() {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
 
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
+        UnhookWinEvent(hook);
     }
 }
