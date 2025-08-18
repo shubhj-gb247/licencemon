@@ -9,6 +9,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+use std::process::Output;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::*;
@@ -21,7 +22,8 @@ use windows::core::PWSTR;
 #[derive(Debug, serde::Serialize, Deserialize)]
 struct TrackingConfig {
     applications: Vec<String>, // vector of strings representing process name which we have to track.
-    interval: i32, // after every [interval] seconds send payload to server.
+    interval: i64, // after every [interval] seconds send payload to server.
+    server : String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -29,6 +31,7 @@ struct TimeCell {
     time_start: Option<DateTime<Utc>>,
     time_end: Option<DateTime<Utc>>,
     duration: i64, // in seconds
+    reporting_interval: i64,
 }
 impl TimeCell {
     fn update_start_time(&mut self) {
@@ -37,12 +40,21 @@ impl TimeCell {
 
     /*
        Updates the end time & calculates duration using start_time and end_time.
+       return 0 => marked end time,
+              1 => marked end time, also send payload as user has worked for more than [reporting_interval] seconds
     */
-    fn update_end_time(&mut self) {
+    fn update_end_time(&mut self)  -> u8 {
+
         self.time_end = Some(Utc::now());
-        self.duration =
-            self.duration + (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
+        let current = (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
+        self.duration = self.duration + current;
+
+        if current > self.reporting_interval{
+            return 1;
+            send_payload(CONFIG.as_ref().unwrap().server.as_str())
+        }
         println!("Duration: {}s ", &self.duration);
+        return 0
     }
 }
 
@@ -169,21 +181,22 @@ unsafe extern "system" fn win_event_proc(
             let title_lower = app_name.to_lowercase();
             println!("Switched to: {}", title_lower.trim());
 
-            let mut data_map = TIME_CELL_MAP.lock().unwrap();
 
             /*
             Update last app time
              */
+            let mut send_payload_to_server : u8 = 0;
             let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
             let data = last_app.last.as_ref();
             match data {
                 Some(app_str) => {
                     println!("last app name: {}", app_str);
+                    let mut data_map = TIME_CELL_MAP.lock().unwrap();
                     let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
                     match ref_data_last {
                         Some(data) => {
                             println!("Updating end time for {app_str}");
-                            data.update_end_time();
+                            send_payload_to_server = data.update_end_time();
                         }
                         None => {
                             println!("Not a tracked last app.");
@@ -192,9 +205,13 @@ unsafe extern "system" fn win_event_proc(
                 }
                 None => println!("No last app."),
             }
+            if send_payload_to_server == 1{
+                send_payload(CONFIG.as_ref().unwrap().server.as_str())
+            }
 
             last_app.last = None; //clear the last app, if the app for which this current event run is generated is tracked last app will be set to that.
 
+            let mut data_map = TIME_CELL_MAP.lock().unwrap();
             let ref_data = data_map.get_mut(&title_lower);
             match ref_data {
                 Some(data) => {
@@ -217,7 +234,30 @@ unsafe extern "system" fn win_event_proc(
 }
 
 
-
+fn send_payload(server:&str){
+    let payload : String ;
+    {
+        let map = TIME_CELL_MAP.lock().unwrap();
+        /*
+            derefrence the mutexguard and I get the hashmap so we do *map
+            then we pass a reference to the hashmap in to_string() call, so we do &*map
+         */
+        payload = serde_json::to_string(&*map).unwrap();
+    }
+    let client = reqwest::blocking::Client::new();
+    let res = client.post(server).json(&payload).send();
+    match res{
+        Ok(resp) => {
+            if !resp.status().is_success(){
+                eprintln!("Server responded with status code {}", resp.status());
+            }
+        },
+        Err(error) => {
+            eprintln!("Server responded with error {}", error);
+        }
+    }
+    println!("{}", payload);
+}
 fn load_icon(path: &str) -> Icon {
     let img = ImageReader::open(path)
         .expect("Failed to open icon file")
@@ -267,6 +307,7 @@ fn main() {
                     time_start: None,
                     time_end: None,
                     duration: 0,
+                    reporting_interval: config.unwrap().interval //check if this call can be improved
                 },
             );
         }
