@@ -1,29 +1,26 @@
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use image::{ImageBuffer, ImageReader, Rgba};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs,
-    path::Path,
+    fs
+    ,
     sync::{Arc, Mutex},
 };
-use std::process::Output;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use windows::core::PWSTR;
 use windows::Win32::Foundation::*;
-use windows::Win32::Storage::FileSystem::*;
-use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::PWSTR;
 
 #[derive(Debug, serde::Serialize, Deserialize)]
 struct TrackingConfig {
     applications: Vec<String>, // vector of strings representing process name which we have to track.
-    interval: i64, // after every [interval] seconds send payload to server.
-    server : String,
+    interval: i64,             // after every [interval] seconds send payload to server.
+    server: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -43,18 +40,16 @@ impl TimeCell {
        return 0 => marked end time,
               1 => marked end time, also send payload as user has worked for more than [reporting_interval] seconds
     */
-    fn update_end_time(&mut self)  -> u8 {
-
+    fn update_end_time(&mut self) -> u8 {
         self.time_end = Some(Utc::now());
         let current = (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
         self.duration = self.duration + current;
-
-        if current > self.reporting_interval{
-            return 1;
-            send_payload(CONFIG.as_ref().unwrap().server.as_str())
-        }
         println!("Duration: {}s ", &self.duration);
-        return 0
+
+        if current > self.reporting_interval {
+            return 1;
+        }
+        0
     }
 }
 
@@ -70,7 +65,7 @@ static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
 static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<u32, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn load_tracking_config() -> Option<TrackingConfig>{
+fn load_tracking_config() -> Option<TrackingConfig> {
     let proj_dirs =
         ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Unable to get project dirs");
     let config_path = proj_dirs.config_dir().join("config.json");
@@ -88,8 +83,8 @@ fn load_tracking_config() -> Option<TrackingConfig>{
         // .unwrap();
         // return default;
         /*
-            If config file doesn't exist in server , return None
-         */
+           If config file doesn't exist in server , return None
+        */
         return None;
     }
 
@@ -97,16 +92,6 @@ fn load_tracking_config() -> Option<TrackingConfig>{
     serde_json::from_str(&data).expect("Invalid JSON format in tracking.json")
 }
 
-fn save_tracking_log() {
-    let proj_dirs =
-        ProjectDirs::from("com", "example", "winwatch-tray").expect("Unable to get project dirs");
-    let log_path = proj_dirs.data_dir().join("tracking_log.json");
-    fs::create_dir_all(proj_dirs.data_dir()).ok();
-
-    let data_map = TIME_CELL_MAP.lock().unwrap();
-    let json = serde_json::to_string_pretty(&*data_map).unwrap();
-    fs::write(&log_path, json).expect("Failed to write tracking_log.json");
-}
 
 fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
     unsafe {
@@ -133,7 +118,7 @@ fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
         match h_process {
             Err(error) => {
                 println!("{error}");
-                return None;
+                None
             }
             Ok(handle) => {
                 let mut buffer = [0u16; 260];
@@ -142,7 +127,7 @@ fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
 
                 let result = QueryFullProcessImageNameW(
                     handle,
-                    windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+                    PROCESS_NAME_FORMAT(0),
                     PWSTR(buffer.as_mut_ptr()),
                     &mut size,
                 );
@@ -167,13 +152,13 @@ fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
 }
 
 unsafe extern "system" fn win_event_proc(
-    _hWinEventHook: HWINEVENTHOOK,
+    _h_win_event_hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
-    _idObject: i32,
-    _idChild: i32,
-    _idEventThread: u32,
-    _dwmsEventTime: u32,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
 ) {
     if event == EVENT_SYSTEM_FOREGROUND {
         println!("=========NEW EVENT_SYSTEM_FOREGROUND=============");
@@ -181,11 +166,10 @@ unsafe extern "system" fn win_event_proc(
             let title_lower = app_name.to_lowercase();
             println!("Switched to: {}", title_lower.trim());
 
-
             /*
             Update last app time
              */
-            let mut send_payload_to_server : u8 = 0;
+            let mut send_payload_to_server: u8 = 0;
             let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
             let data = last_app.last.as_ref();
             match data {
@@ -205,7 +189,7 @@ unsafe extern "system" fn win_event_proc(
                 }
                 None => println!("No last app."),
             }
-            if send_payload_to_server == 1{
+            if send_payload_to_server == 1 {
                 send_payload(CONFIG.as_ref().unwrap().server.as_str())
             }
 
@@ -233,32 +217,31 @@ unsafe extern "system" fn win_event_proc(
     }
 }
 
-
-fn send_payload(server:&str){
-    let payload : String ;
+fn send_payload(server: &str) {
+    let payload: String;
     {
         let map = TIME_CELL_MAP.lock().unwrap();
         /*
-            derefrence the mutexguard and I get the hashmap so we do *map
-            then we pass a reference to the hashmap in to_string() call, so we do &*map
-         */
+           derefrence the mutexguard and I get the hashmap so we do *map
+           then we pass a reference to the hashmap in to_string() call, so we do &*map
+        */
         payload = serde_json::to_string(&*map).unwrap();
     }
     let client = reqwest::blocking::Client::new();
     let res = client.post(server).json(&payload).send();
-    match res{
+    match res {
         Ok(resp) => {
-            if !resp.status().is_success(){
+            if !resp.status().is_success() {
                 eprintln!("Server responded with status code {}", resp.status());
             }
-        },
+        }
         Err(error) => {
             eprintln!("Server responded with error {}", error);
         }
     }
     println!("{}", payload);
 }
-fn load_icon(path: &str) -> Icon {
+fn _load_icon(path: &str) -> Icon {
     let img = ImageReader::open(path)
         .expect("Failed to open icon file")
         .decode()
@@ -282,8 +265,7 @@ fn build_icon() -> Icon {
     Icon::from_rgba(rgba, size, size).expect("icon")
 }
 fn main() {
-
-    if CONFIG.is_none(){
+    if CONFIG.is_none() {
         println!("No config file detected .");
         return;
     }
@@ -297,8 +279,7 @@ fn main() {
 
         let mut data_map = TIME_CELL_MAP.lock().unwrap();
 
-        for x in &config.unwrap().applications{
-
+        for x in &config.unwrap().applications {
             println!("{}", x);
 
             data_map.insert(
@@ -307,7 +288,7 @@ fn main() {
                     time_start: None,
                     time_end: None,
                     duration: 0,
-                    reporting_interval: config.unwrap().interval //check if this call can be improved
+                    reporting_interval: config.unwrap().interval, //check if this call can be improved
                 },
             );
         }
@@ -338,10 +319,10 @@ fn main() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).into() {
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        UnhookWinEvent(hook);
+        let _ = UnhookWinEvent(hook);
     }
 }
