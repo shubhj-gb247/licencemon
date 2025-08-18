@@ -5,6 +5,7 @@ use image::{ImageBuffer, ImageReader, Rgba};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::{collections::HashMap, fs, sync::{Arc, Mutex}, thread};
+use std::iter::Map;
 use std::time::Duration;
 use serde_json::Value;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -54,7 +55,7 @@ impl TimeCell {
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 struct WinRecord {
-    last: Option<String>,
+    last: Option<String>, //represent last tracked app in focus.
 }
 static CONFIG: Lazy<Option<TrackingConfig>> = Lazy::new(load_tracking_config);
 static TIME_CELL_MAP: Lazy<Mutex<HashMap<String, TimeCell>>> =
@@ -170,9 +171,11 @@ unsafe extern "system" fn win_event_proc(
             let mut send_payload_to_server: u8 = 0;
             let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
             let data = last_app.last.as_ref();
+            let mut last_app_str : String = String::new();
             match data {
                 Some(app_str) => {
                     println!("last app name: {}", app_str);
+                    last_app_str = app_str.clone();
                     let mut data_map = TIME_CELL_MAP.lock().unwrap();
                     let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
                     match ref_data_last {
@@ -188,7 +191,7 @@ unsafe extern "system" fn win_event_proc(
                 None => println!("No last app."),
             }
             if send_payload_to_server == 1 {
-                send_payload(CONFIG.as_ref().unwrap().server.as_str())
+                send_payload(CONFIG.as_ref().unwrap().server.as_str(),last_app_str.as_str());
             }
 
             last_app.last = None; //clear the last app, if the app for which this current event run is generated is tracked last app will be set to that.
@@ -215,22 +218,31 @@ unsafe extern "system" fn win_event_proc(
     }
 }
 
-fn send_payload(server: &str) {
-    let map_ser : String;
-    {
+fn send_payload(server: &str, key: &str) {
+    let val : &TimeCell ;
         let map = TIME_CELL_MAP.lock().unwrap();
-        /*
-           derefrence the mutexguard and I get the hashmap so we do *map
-           then we pass a reference to the hashmap in to_string() call, so we do &*map
-        */
-        map_ser = serde_json::to_string(&*map).unwrap();
-    }
-    let mut json_obj:Value = serde_json::from_str(map_ser.as_str()).unwrap();
+
+        if let Some(cell) = map.get(key){
+            val = cell;
+        }
+        else{
+            return;
+        }
+    // map_ser = serde_json::to_string(&*map).unwrap();
     let hostname = String::from(hostname::get().unwrap().to_str().unwrap());
-    json_obj["hostname"] = json!(hostname);
-    let payload = serde_json::to_string(&json_obj).unwrap();
+    // let mut json_obj:Value = serde_json::from_str(map_ser.as_str()).unwrap();
+    let mut payload = serde_json::Map::new();
+    payload.insert("hostname".to_string(), serde_json::Value::String(hostname));
+    payload.insert(
+        key.to_string(),
+        json!({
+            "duration" : val.duration,
+        }),
+    );
+    // json_obj["hostname"] = json!(hostname);
+    // let payload = serde_json::to_string(&json_obj).unwrap();
     let client = reqwest::blocking::Client::new();
-    let res = client.post(server).header("Content-Type", "application/json").body(payload.clone()).send();
+    let res = client.post(server).header("Content-Type", "application/json").json(&payload).send();
     match res {
         Ok(resp) => {
             if !resp.status().is_success() {
@@ -241,7 +253,7 @@ fn send_payload(server: &str) {
             eprintln!("Server responded with error {}", error);
         }
     }
-    println!("{}", payload);
+    println!("{:?}", payload);
 }
 fn _load_icon(path: &str) -> Icon {
     let img = ImageReader::open(path)
