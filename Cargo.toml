@@ -12,7 +12,6 @@ strip = true
 
 [dependencies]
 anyhow = "1"
-thiserror = "2"
 chrono = {version = "0.4", features = ["serde"]}
 directories = "6"
 hostname = "0.4"

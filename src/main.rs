@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
 use anyhow::{Context, Result};
 use chrono::Utc;
 use image::ImageReader;
@@ -130,7 +130,7 @@ fn monitor_loop(is_running: Arc<AtomicBool>, cfg: AppConfig, _keywords: HashSet<
     let interval = Duration::from_secs(cfg.interval_secs.max(5));
     while is_running.load(Ordering::SeqCst) {
         let titles = get_window_titles();
-        println!("{:?}",titles);
+        println!("{:#?}",titles);
         // let matched: Vec<String> = titles
         //     .into_iter()
         //     .filter(|t| {

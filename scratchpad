@@ -1,0 +1,3 @@
+In this branch I aim to implement the time tracking of active window feature.
+We get event from windows api whenever focus changes, we use it with timestamp to
+calculate the time interested app window was active.

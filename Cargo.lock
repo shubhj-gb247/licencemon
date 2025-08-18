@@ -1069,7 +1069,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.15",
  "tray-icon",
  "windows",
 ]
