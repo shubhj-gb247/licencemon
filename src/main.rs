@@ -1,3 +1,4 @@
+use serde_json::json;
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use image::{ImageBuffer, ImageReader, Rgba};
@@ -5,16 +6,16 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs
-    ,
+    fs,
     sync::{Arc, Mutex},
 };
+use serde_json::Value;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
-use windows::core::PWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::PWSTR;
 
 #[derive(Debug, serde::Serialize, Deserialize)]
 struct TrackingConfig {
@@ -91,7 +92,6 @@ fn load_tracking_config() -> Option<TrackingConfig> {
     let data = fs::read_to_string(config_path).expect("Failed to read config.json");
     serde_json::from_str(&data).expect("Invalid JSON format in tracking.json")
 }
-
 
 fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
     unsafe {
@@ -218,15 +218,19 @@ unsafe extern "system" fn win_event_proc(
 }
 
 fn send_payload(server: &str) {
-    let payload: String;
+    let map_ser : String;
     {
         let map = TIME_CELL_MAP.lock().unwrap();
         /*
            derefrence the mutexguard and I get the hashmap so we do *map
            then we pass a reference to the hashmap in to_string() call, so we do &*map
         */
-        payload = serde_json::to_string(&*map).unwrap();
+        map_ser = serde_json::to_string(&*map).unwrap();
     }
+    let mut json_obj:Value = serde_json::from_str(map_ser.as_str()).unwrap();
+    let hostname = String::from(hostname::get().unwrap().to_str().unwrap());
+    json_obj["hostname"] = json!(hostname);
+    let payload = serde_json::to_string(&json_obj).unwrap();
     let client = reqwest::blocking::Client::new();
     let res = client.post(server).json(&payload).send();
     match res {
