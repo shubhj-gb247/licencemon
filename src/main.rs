@@ -4,11 +4,8 @@ use directories::ProjectDirs;
 use image::{ImageBuffer, ImageReader, Rgba};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    fs,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, fs, sync::{Arc, Mutex}, thread};
+use std::time::Duration;
 use serde_json::Value;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::*;
@@ -44,7 +41,8 @@ impl TimeCell {
     fn update_end_time(&mut self) -> u8 {
         self.time_end = Some(Utc::now());
         let current = (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
-        self.duration = self.duration + current;
+        // self.duration = self.duration + current;
+        self.duration = current; //handling persistence of time in DB not here.
         println!("Duration: {}s ", &self.duration);
 
         if current > self.reporting_interval {
@@ -232,7 +230,7 @@ fn send_payload(server: &str) {
     json_obj["hostname"] = json!(hostname);
     let payload = serde_json::to_string(&json_obj).unwrap();
     let client = reqwest::blocking::Client::new();
-    let res = client.post(server).json(&payload).send();
+    let res = client.post(server).header("Content-Type", "application/json").body(payload.clone()).send();
     match res {
         Ok(resp) => {
             if !resp.status().is_success() {
@@ -270,7 +268,8 @@ fn build_icon() -> Icon {
 }
 fn main() {
     if CONFIG.is_none() {
-        println!("No config file detected .");
+        println!("No config file was detected .");
+        thread::sleep(Duration::from_secs(3));
         return;
     }
 
