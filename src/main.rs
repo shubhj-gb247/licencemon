@@ -1,12 +1,22 @@
 //#![windows_subsystem = "windows"]
-use serde_json::json;
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
-use image::{ImageBuffer, ImageReader, Rgba};
+use image::{ImageBuffer, Rgba};
+use notify::event::ModifyKind;
+use notify::{Event};
+use notify::{EventKind, RecursiveMode, Result, Watcher};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use std::{collections::HashMap, fs, sync::{Arc, Mutex}, thread};
-use std::time::Duration;
+use serde_json::json;
+use std::path::Path;
+use std::sync::mpsc;
+use std::{
+    collections::HashMap,
+    fs,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
@@ -14,10 +24,13 @@ use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PWSTR;
 
-#[derive(Debug, serde::Serialize, Deserialize)]
+// ================================
+// Structs
+// ================================
+#[derive(Debug, serde::Serialize, Deserialize, Clone)]
 struct TrackingConfig {
     applications: Vec<String>, // vector of strings representing process name which we have to track.
-    interval: i64,             // after every [interval] seconds send payload to server.
+    interval: i64, // after every [interval] seconds of work on an app, send payload to server.
     server: String,
 }
 
@@ -28,35 +41,42 @@ struct TimeCell {
     duration: i64, // in seconds
     reporting_interval: i64,
 }
+
 impl TimeCell {
     fn update_start_time(&mut self) {
         self.time_start = Some(Utc::now());
     }
 
-    /*
-       Updates the end time & calculates duration using start_time and end_time.
-       return 0 => marked end time,
-              1 => marked end time, also send payload as user has worked for more than [reporting_interval] seconds
-    */
-    fn update_end_time(&mut self) -> u8 {
+    fn update_end_time(&mut self, reporting_interval: i64) -> u8 {
         self.time_end = Some(Utc::now());
-        let current = (self.time_end.unwrap() - self.time_start.unwrap()).num_seconds();
-        // self.duration = self.duration + current;
-        self.duration = current; //handling persistence of time in DB not here.
-        println!("Duration: {}s ", &self.duration);
-
-        if current > self.reporting_interval {
-            return 1;
+        match self.time_start {
+            Some(time_start) => {
+                let current = (self.time_end.unwrap() - time_start).num_seconds();
+                self.duration = current;
+                println!("Duration: {}s", self.duration);
+                if current > reporting_interval { 1 } else { 0 }
+            }
+            None => {
+                /*
+                in the case when we switch to an untracked application, then the config changes make it tracked
+                and when the said application is switched from, update_end_time is called but the start_time is none
+                 */
+                return 2;
+            }
         }
-        0
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct WinRecord {
-    last: Option<String>, //represent last tracked app in focus.
+    last: Option<String>,
 }
-static CONFIG: Lazy<Option<TrackingConfig>> = Lazy::new(load_tracking_config);
+
+// ================================
+// Global state
+// ================================
+static CONFIG: Lazy<Mutex<Option<TrackingConfig>>> =
+    Lazy::new(|| Mutex::new(load_tracking_config()));
 static TIME_CELL_MAP: Lazy<Mutex<HashMap<String, TimeCell>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
@@ -64,93 +84,119 @@ static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
 static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<u32, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// ================================
+// Load config
+// ================================
 fn load_tracking_config() -> Option<TrackingConfig> {
     let proj_dirs =
-        ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Unable to get project dirs");
+        ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Project directory not found");
     let config_path = proj_dirs.config_dir().join("config.json");
 
     if !config_path.exists() {
-        // let default = TrackingConfig {
-        //     applications: vec!["notepad.exe".into(), "chrome.exe".into()],
-        //     interval: 10,
-        // };
-        // fs::create_dir_all(proj_dirs.config_dir()).ok();
-        // fs::write(
-        //     &config_path,
-        //     serde_json::to_string_pretty(&default).unwrap(),
-        // )
-        // .unwrap();
-        // return default;
-        /*
-           If config file doesn't exist in server , return None
-        */
         return None;
     }
 
-    let data = fs::read_to_string(config_path).expect("Failed to read config.json");
-    serde_json::from_str(&data).expect("Invalid JSON format in tracking.json")
+    let data = fs::read_to_string(config_path).ok()?;
+    println!("Config: {}", data);
+    serde_json::from_str(&data).ok()
 }
 
-fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
-    unsafe {
-        let mut pid: u32 = 0;
-
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-
-        if pid == 0 {
-            return None;
-        }
-        //check cache first
+fn reload_config() {
+    if let Some(cfg) = load_tracking_config() {
         {
-            let cache = PROCESS_NAME_CACHE.lock().unwrap();
-            if let Some(name) = cache.get(&pid) {
-                println!("Returning cached app name ");
-                return Some(name.clone());
-            }
+            let mut config_lock = CONFIG.lock().unwrap();
+            *config_lock = Some(cfg.clone());
+            println!("[Config] Reloaded config.json");
         }
+        /*
+        to create key-val pairs of new tracked applications.
+        this approach can be improved by removing keys which exist in map but not in new config,
+        and adding keys present in config but not in map.
+        using retain and entry().or_insert() functions.
 
-        println!("Getting process handle");
+        Right now we nuke the entire map and create keys again.
+        */
+        init_time_cell();
 
-        let h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        println!("Reloaded TimeCell Map");
+    }
+}
 
-        match h_process {
-            Err(error) => {
-                println!("{error}");
-                None
-            }
-            Ok(handle) => {
-                let mut buffer = [0u16; 260];
-                // let mut buffer_ptr= PWSTR::default();
-                let mut size = buffer.len() as u32;
+// ================================
+// Watch config file
+// ================================
+fn watch_config_file() {
+    let proj_dirs = ProjectDirs::from("", "Neilsoft", "LicensemonTT").unwrap();
+    let config_path = proj_dirs.config_dir().join("config.json");
 
-                let result = QueryFullProcessImageNameW(
-                    handle,
-                    PROCESS_NAME_FORMAT(0),
-                    PWSTR(buffer.as_mut_ptr()),
-                    &mut size,
-                );
+    let (tx, rx) = mpsc::channel::<Result<Event>>();
+    let mut watcher = notify::recommended_watcher(tx).expect("Unable to create file watcher");
+    // watcher.watch(Path::new("C:/Users/ShubhS/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json"), RecursiveMode::Recursive).expect("Couldn't start watching");
+    watcher
+        .watch(Path::new(config_path.as_path()), RecursiveMode::Recursive)
+        .expect("Couldn't start watching");
 
-                CloseHandle(handle).expect("Couldn't close handle");
-
-                if result.is_err() {
-                    return None;
+    for res in rx {
+        match res {
+            Ok(event) => {
+                println!("{:?}", event);
+                if event.kind == EventKind::Modify(ModifyKind::Any) {
+                    println!("Modify Event -> Reloading Config");
+                    reload_config();
                 }
-
-                let exe_path = String::from_utf16_lossy(&buffer[..size as usize]);
-                let exe_path = exe_path.split('\\').last()?.to_string();
-                {
-                    // Insert pid and exe name in map
-                    let mut cache = PROCESS_NAME_CACHE.lock().unwrap();
-                    cache.insert(pid, exe_path.clone());
-                }
-                Some(exe_path)
             }
+            Err(e) => println!("watch error: {:?}", e),
         }
     }
 }
 
+// ================================
+// Windows process detection
+// ================================
+fn get_process_name_from_hwnd(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+
+        // check cache
+        if let Some(name) = PROCESS_NAME_CACHE.lock().unwrap().get(&pid) {
+            return Some(name.clone());
+        }
+
+        let h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = [0u16; 260];
+        let mut size = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            h_process,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        );
+        CloseHandle(h_process).ok()?;
+        if result.is_err() {
+            return None;
+        }
+
+        let exe_path = String::from_utf16_lossy(&buffer[..size as usize])
+            .split('\\')
+            .last()?
+            .to_string();
+        PROCESS_NAME_CACHE
+            .lock()
+            .unwrap()
+            .insert(pid, exe_path.clone());
+        Some(exe_path)
+    }
+}
+
+// ================================
+// Focus change event
+// ================================
 unsafe extern "system" fn win_event_proc(
-    _h_win_event_hook: HWINEVENTHOOK,
+    _hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
     _id_object: i32,
@@ -158,157 +204,137 @@ unsafe extern "system" fn win_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    if event == EVENT_SYSTEM_FOREGROUND {
-        println!("=========NEW EVENT_SYSTEM_FOREGROUND=============");
-        if let Some(app_name) = get_process_name_from_hwnd(hwnd) {
-            let title_lower = app_name.to_lowercase();
-            println!("Switched to: {}", title_lower.trim());
+    if event != EVENT_SYSTEM_FOREGROUND {
+        return;
+    }
 
-            /*
-            Update last app time
-             */
-            let mut send_payload_to_server: u8 = 0;
-            let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
-            let data = last_app.last.as_ref();
-            let mut last_app_str : String = String::new();
-            match data {
-                Some(app_str) => {
-                    println!("last app name: {}", app_str);
-                    last_app_str = app_str.clone();
-                    let mut data_map = TIME_CELL_MAP.lock().unwrap();
-                    let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
-                    match ref_data_last {
-                        Some(data) => {
-                            println!("Updating end time for {app_str}");
-                            send_payload_to_server = data.update_end_time();
-                        }
-                        None => {
-                            println!("Not a tracked last app.");
-                        }
-                    }
-                }
-                None => println!("No last app."),
+    if let Some(app_name) = get_process_name_from_hwnd(hwnd) {
+        let app_name_lower = app_name.to_lowercase();
+        println!("Switched to: {}", app_name_lower);
+
+        let mut current_reporting_interval: i64 = 5;
+        {
+            let cfg = CONFIG.lock().unwrap();
+            if let Some(cfg) = cfg.as_ref() {
+                current_reporting_interval = cfg.interval
             }
-            // if send_payload_to_server == 1 {
-            //     send_payload(CONFIG.as_ref().unwrap().server.as_str(),last_app_str.as_str());
-            // }
+        }
 
-            last_app.last = None; //clear the last app, if the app for which this current event run is generated is tracked last app will be set to that.
+        let mut send_payload_flag = 0;
+        let mut last_app_lock = WIN_RECORD_INSTANCE.lock().unwrap();
+        if let Some(last) = &last_app_lock.last {
+            let mut map_lock = TIME_CELL_MAP.lock().unwrap();
+            if let Some(cell) = map_lock.get_mut(last) {
+                send_payload_flag = cell.update_end_time(current_reporting_interval);
+            }
+        }
 
-            let mut data_map = TIME_CELL_MAP.lock().unwrap();
-            let ref_data = data_map.get_mut(&title_lower);
-            match ref_data {
-                Some(data) => {
-                    println!("Updating start for {}", title_lower.trim());
-                    data.update_start_time();
-                }
-                None => {
-                    println!("Not interested in the switched application");
-                    return;
-                    /*
-                    If we switched to a non-tracked app, we won't update it as last app and
-                    return above.
-                     */
+        if send_payload_flag == 1 {
+            let cfg = CONFIG.lock().unwrap();
+            if let Some(cfg) = cfg.as_ref() {
+                if let Some(last) = &last_app_lock.last {
+                    send_payload(&cfg.server, last);
                 }
             }
+        } else if send_payload_flag == 2 {
+            println!(
+                "Corner Case [untracked application with None start_time was made tracked when config changed.]"
+            )
+        }
 
-            last_app.last = Some(title_lower);
+        // Update current app start
+        let mut map_lock = TIME_CELL_MAP.lock().unwrap();
+        if let Some(cell) = map_lock.get_mut(&app_name_lower) {
+            cell.update_start_time();
+            last_app_lock.last = Some(app_name_lower);
+        } else {
+            println!("Not tracked app: {}", app_name_lower);
         }
     }
 }
 
+// ================================
+// Send payload
+// ================================
 fn send_payload(server: &str, key: &str) {
-    let val : &TimeCell ;
+    let val = {
         let map = TIME_CELL_MAP.lock().unwrap();
-
-        if let Some(cell) = map.get(key){
-            val = cell;
-        }
-        else{
+        if let Some(cell) = map.get(key) {
+            cell.clone()
+        } else {
             return;
         }
-    // map_ser = serde_json::to_string(&*map).unwrap();
-    let hostname = String::from(hostname::get().unwrap().to_str().unwrap());
-    // let mut json_obj:Value = serde_json::from_str(map_ser.as_str()).unwrap();
+    };
+
+    let hostname = hostname::get().unwrap().to_string_lossy().to_string();
     let mut payload = serde_json::Map::new();
-    payload.insert("hostname".to_string(), serde_json::Value::String(hostname));
-    payload.insert(
-        key.to_string(),
-        json!({
-            "duration" : val.duration,
-        }),
-    );
-    // json_obj["hostname"] = json!(hostname);
-    // let payload = serde_json::to_string(&json_obj).unwrap();
+    payload.insert("hostname".into(), json!(hostname));
+    payload.insert(key.into(), json!({ "duration": val.duration }));
+
     let client = reqwest::blocking::Client::new();
-    let res = client.post(server).header("Content-Type", "application/json").json(&payload).send();
-    match res {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                eprintln!("Server responded with status code {}", resp.status());
-            }
-        }
-        Err(error) => {
-            eprintln!("Server responded with error {}", error);
-        }
+    match client
+        .post(server)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => eprintln!("Server responded with status: {}", resp.status()),
+        Err(e) => eprintln!("Server error: {:?}", e),
     }
-    println!("{:?}", payload);
+    println!("Payload sent: {:?}", payload);
 }
-fn _load_icon(path: &str) -> Icon {
-    let img = ImageReader::open(path)
-        .expect("Failed to open icon file")
-        .decode()
-        .expect("Failed to decode image")
-        .to_rgba8();
-    let (width, height) = img.dimensions();
-    Icon::from_rgba(img.into_raw(), width, height).expect("Failed to create icon")
-}
+
+// ================================
+// Tray icon
+// ================================
 fn build_icon() -> Icon {
-    let size = 16u32;
+    let size = 16;
     let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(size, size);
     for (x, y, p) in img.enumerate_pixels_mut() {
         let on = ((x / 2 + y / 2) % 2) == 0;
         *p = if on {
-            Rgba([0u8, 140u8, 255u8, 255u8])
+            Rgba([0, 140, 255, 255])
         } else {
             Rgba([255, 255, 255, 255])
         };
     }
-    let rgba = img.into_raw();
-    Icon::from_rgba(rgba, size, size).expect("icon")
+    Icon::from_rgba(img.into_raw(), size, size).unwrap()
 }
-fn main() {
-    if CONFIG.is_none() {
-        println!("No config file was detected .");
-        thread::sleep(Duration::from_secs(3));
-        return;
-    }
 
-    let config = CONFIG.as_ref();
-
+fn init_time_cell() {
+    let cfg = CONFIG.lock().unwrap().as_ref().unwrap().clone();
     {
-        /*
-        Added scope to return the lock on TIME_CELL_MAP
-         */
-
-        let mut data_map = TIME_CELL_MAP.lock().unwrap();
-
-        for x in &config.unwrap().applications {
-            println!("{}", x);
-
-            data_map.insert(
-                x.clone(),
-                TimeCell {
-                    time_start: None,
-                    time_end: None,
-                    duration: 0,
-                    reporting_interval: config.unwrap().interval, //check if this call can be improved
-                },
-            );
+        let mut map = TIME_CELL_MAP.lock().unwrap();
+        map.clear(); //clearing required when config is reloaded.
+        for app in &cfg.applications {
+            map.entry(app.clone()).or_insert(TimeCell {
+                time_start: None,
+                time_end: None,
+                duration: 0,
+                reporting_interval: cfg.interval,
+            });
+        }
+    }
+}
+// ================================
+// Main
+// ================================
+fn main() {
+    {
+        let cfg_lock = CONFIG.lock().unwrap();
+        if cfg_lock.is_none() {
+            println!("No config file found.");
+            thread::sleep(Duration::from_secs(3));
+            return;
         }
     }
 
-    //let icon = load_icon("assets/ns.png");
+    let watcher_handle = thread::spawn(watch_config_file);
+
+    // Initialize TIME_CELL_MAP
+    init_time_cell();
+
     let icon = build_icon();
     let _tray_icon: Arc<TrayIcon> = Arc::new(
         TrayIconBuilder::new()
@@ -329,7 +355,7 @@ fn main() {
             WINEVENT_OUTOFCONTEXT,
         );
 
-        println!("Tray app running with custom icon. Listening for focus changes...");
+        println!("Tray app running. Listening for focus changes...");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).into() {
@@ -339,4 +365,6 @@ fn main() {
 
         let _ = UnhookWinEvent(hook);
     }
+
+    watcher_handle.join().unwrap(); // not necessary I think
 }
