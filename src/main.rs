@@ -1,3 +1,4 @@
+//#![windows_subsystem = "windows"]
 use serde_json::json;
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
@@ -5,9 +6,7 @@ use image::{ImageBuffer, ImageReader, Rgba};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::{collections::HashMap, fs, sync::{Arc, Mutex}, thread};
-use std::iter::Map;
 use std::time::Duration;
-use serde_json::Value;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
@@ -190,9 +189,9 @@ unsafe extern "system" fn win_event_proc(
                 }
                 None => println!("No last app."),
             }
-            if send_payload_to_server == 1 {
-                send_payload(CONFIG.as_ref().unwrap().server.as_str(),last_app_str.as_str());
-            }
+            // if send_payload_to_server == 1 {
+            //     send_payload(CONFIG.as_ref().unwrap().server.as_str(),last_app_str.as_str());
+            // }
 
             last_app.last = None; //clear the last app, if the app for which this current event run is generated is tracked last app will be set to that.
 
