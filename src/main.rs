@@ -61,7 +61,7 @@ impl TimeCell {
                 in the case when we switch to an untracked application, then the config changes make it tracked
                 and when the said application is switched from, update_end_time is called but the start_time is none
                  */
-                return 2;
+                2
             }
         }
     }
@@ -83,20 +83,21 @@ static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
     Lazy::new(|| Mutex::new(WinRecord { last: None }));
 static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<u32, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static CONFIG_PATH: Lazy<&Path> = Lazy::new(|| {Path::new("//10.1.3.154/Users/Admin/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json")});
 
 // ================================
 // Load config
 // ================================
 fn load_tracking_config() -> Option<TrackingConfig> {
-    let proj_dirs =
-        ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Project directory not found");
-    let config_path = proj_dirs.config_dir().join("config.json");
+    // let proj_dirs =
+    //     ProjectDirs::from("", "Neilsoft", "LicensemonTT").expect("Project directory not found");
+    // let config_path = proj_dirs.config_dir().join("config.json");
 
-    if !config_path.exists() {
+    if !CONFIG_PATH.exists() {
         return None;
     }
 
-    let data = fs::read_to_string(config_path).ok()?;
+    let data = fs::read_to_string(CONFIG_PATH.as_os_str()).ok()?;
     println!("Config: {}", data);
     serde_json::from_str(&data).ok()
 }
@@ -126,16 +127,17 @@ fn reload_config() {
 // Watch config file
 // ================================
 fn watch_config_file() {
-    let proj_dirs = ProjectDirs::from("", "Neilsoft", "LicensemonTT").unwrap();
-    let config_path = proj_dirs.config_dir().join("config.json");
+    // let proj_dirs = ProjectDirs::from("", "Neilsoft", "LicensemonTT").unwrap();
+    // let config_path = proj_dirs.config_dir().join("config.json");
 
     let (tx, rx) = mpsc::channel::<Result<Event>>();
     let mut watcher = notify::recommended_watcher(tx).expect("Unable to create file watcher");
     // watcher.watch(Path::new("C:/Users/ShubhS/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json"), RecursiveMode::Recursive).expect("Couldn't start watching");
     watcher
-        .watch(Path::new(config_path.as_path()), RecursiveMode::Recursive)
+        .watch(Path::new(CONFIG_PATH.as_os_str()), RecursiveMode::Recursive)
         .expect("Couldn't start watching");
 
+    println!("Watching: {}", CONFIG_PATH.display());
     for res in rx {
         match res {
             Ok(event) => {
