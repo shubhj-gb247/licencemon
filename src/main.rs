@@ -2,8 +2,8 @@
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use image::{ImageBuffer, Rgba};
+use notify::Event;
 use notify::event::ModifyKind;
-use notify::{Event};
 use notify::{EventKind, RecursiveMode, Result, Watcher};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -204,51 +204,76 @@ unsafe extern "system" fn win_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    if event != EVENT_SYSTEM_FOREGROUND {
-        return;
-    }
+    if event == EVENT_SYSTEM_FOREGROUND {
+        println!("=========NEW EVENT_SYSTEM_FOREGROUND=============");
+        if let Some(app_name) = get_process_name_from_hwnd(hwnd) {
+            let title_lower = app_name.to_lowercase();
+            println!("Switched to: {}", title_lower.trim());
 
-    if let Some(app_name) = get_process_name_from_hwnd(hwnd) {
-        let app_name_lower = app_name.to_lowercase();
-        println!("Switched to: {}", app_name_lower);
-
-        let mut current_reporting_interval: i64 = 5;
-        {
-            let cfg = CONFIG.lock().unwrap();
-            if let Some(cfg) = cfg.as_ref() {
-                current_reporting_interval = cfg.interval
-            }
-        }
-
-        let mut send_payload_flag = 0;
-        let mut last_app_lock = WIN_RECORD_INSTANCE.lock().unwrap();
-        if let Some(last) = &last_app_lock.last {
-            let mut map_lock = TIME_CELL_MAP.lock().unwrap();
-            if let Some(cell) = map_lock.get_mut(last) {
-                send_payload_flag = cell.update_end_time(current_reporting_interval);
-            }
-        }
-
-        if send_payload_flag == 1 {
-            let cfg = CONFIG.lock().unwrap();
-            if let Some(cfg) = cfg.as_ref() {
-                if let Some(last) = &last_app_lock.last {
-                    send_payload(&cfg.server, last);
+            let mut current_reporting_interval: i64 = 5;
+            {
+                let cfg = CONFIG.lock().unwrap();
+                if let Some(cfg) = cfg.as_ref() {
+                    current_reporting_interval = cfg.interval
                 }
             }
-        } else if send_payload_flag == 2 {
-            println!(
-                "Corner Case [untracked application with None start_time was made tracked when config changed.]"
-            )
-        }
 
-        // Update current app start
-        let mut map_lock = TIME_CELL_MAP.lock().unwrap();
-        if let Some(cell) = map_lock.get_mut(&app_name_lower) {
-            cell.update_start_time();
-            last_app_lock.last = Some(app_name_lower);
-        } else {
-            println!("Not tracked app: {}", app_name_lower);
+            /*
+            Update last app time
+             */
+            let mut send_payload_to_server: u8 = 0;
+            let mut last_app = WIN_RECORD_INSTANCE.lock().unwrap();
+            let data = last_app.last.as_ref();
+            let mut last_app_str: String = String::new();
+            match data {
+                Some(app_str) => {
+                    println!("last app name: {}", app_str);
+                    last_app_str = app_str.clone();
+                    let mut data_map = TIME_CELL_MAP.lock().unwrap();
+                    let ref_data_last = data_map.get_mut(last_app.last.as_ref().unwrap());
+                    match ref_data_last {
+                        Some(data) => {
+                            println!("Updating end time for {app_str}");
+                            send_payload_to_server =
+                                data.update_end_time(current_reporting_interval);
+                        }
+                        None => {
+                            println!("Not a tracked last app.");
+                        }
+                    }
+                }
+                None => println!("No last app."),
+            }
+
+            if send_payload_to_server == 1 {
+                send_payload(CONFIG.lock().unwrap().as_ref().unwrap().server.as_str(),last_app_str.as_str());
+            }
+            else if send_payload_to_server == 2 {
+                println!(
+                    "Corner Case [untracked application with None start_time was made tracked when config changed.]"
+                )
+            }
+
+            last_app.last = None;
+
+            let mut data_map = TIME_CELL_MAP.lock().unwrap();
+            let ref_data = data_map.get_mut(&title_lower);
+            match ref_data {
+                Some(data) => {
+                    println!("Updating start for {}", title_lower.trim());
+                    data.update_start_time();
+                }
+                None => {
+                    println!("Not interested in the switched application");
+                    return;
+                    /*
+                    If we switched to a non-tracked app, we won't update it as last app and
+                    return above.
+                     */
+                }
+            }
+
+            last_app.last = Some(title_lower);
         }
     }
 }
