@@ -1,9 +1,8 @@
-//#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 use chrono::{DateTime, Utc};
-use directories::ProjectDirs;
 use image::{ImageBuffer, Rgba};
-use notify::Event;
 use notify::event::ModifyKind;
+use notify::Event;
 use notify::{EventKind, RecursiveMode, Result, Watcher};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -18,11 +17,11 @@ use std::{
     time::Duration,
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use windows::core::PWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::PWSTR;
 
 // ================================
 // Structs
