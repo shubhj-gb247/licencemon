@@ -22,3 +22,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 notify = "8.2.0"
 # Win32 APIs
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_System", "Win32_System_Threading", "Win32_Storage", "Win32_System_Diagnostics", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp"] }
+
+[build-dependencies]
+winres = "0.1"

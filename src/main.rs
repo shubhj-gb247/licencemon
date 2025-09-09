@@ -74,7 +74,8 @@ struct WinRecord {
 // ================================
 // Global state
 // ================================
-static CONFIG_PATH: Lazy<&Path> = Lazy::new(|| {Path::new("http://10.1.3.154/Users/Admin/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json")});
+// static CONFIG_PATH: Lazy<&Path> = Lazy::new(|| {Path::new("//10.1.3.154/Users/Admin/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json")});
+static CONFIG_PATH: Lazy<&Path> = Lazy::new(|| {Path::new("//10.1.2.215/licensemon_srv/config.json")});
 static CONFIG: Lazy<Mutex<Option<TrackingConfig>>> =
     Lazy::new(|| Mutex::new(load_tracking_config()));
 static TIME_CELL_MAP: Lazy<Mutex<HashMap<String, TimeCell>>> =
