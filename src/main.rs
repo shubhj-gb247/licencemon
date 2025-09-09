@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
 use chrono::{DateTime, Utc};
 use image::{ImageBuffer, Rgba};
 use notify::event::ModifyKind;
@@ -74,6 +74,7 @@ struct WinRecord {
 // ================================
 // Global state
 // ================================
+static CONFIG_PATH: Lazy<&Path> = Lazy::new(|| {Path::new("http://10.1.3.154/Users/Admin/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json")});
 static CONFIG: Lazy<Mutex<Option<TrackingConfig>>> =
     Lazy::new(|| Mutex::new(load_tracking_config()));
 static TIME_CELL_MAP: Lazy<Mutex<HashMap<String, TimeCell>>> =
@@ -82,7 +83,6 @@ static WIN_RECORD_INSTANCE: Lazy<Mutex<WinRecord>> =
     Lazy::new(|| Mutex::new(WinRecord { last: None }));
 static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<u32, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static CONFIG_PATH: Lazy<&Path> = Lazy::new(|| {Path::new("//10.1.3.154/Users/Admin/AppData/Roaming/Neilsoft/LicensemonTT/config/config.json")});
 
 // ================================
 // Load config
