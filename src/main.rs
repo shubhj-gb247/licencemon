@@ -294,9 +294,11 @@ fn send_payload(server: &str, key: &str) {
     };
 
     let hostname = hostname::get().unwrap().to_string_lossy().to_string();
+    let username = whoami::username();
     let mut payload = serde_json::Map::new();
     payload.insert("hostname".into(), json!(hostname));
-    payload.insert(key.into(), json!({ "duration": val.duration }));
+    payload.insert("username".into() , json!(username));
+    payload.insert(key.into(), json!({ "duration": val.duration}));
 
     let client = reqwest::blocking::Client::new();
     match client
